@@ -1,6 +1,6 @@
 // controllers/export.controller.js
 const { pool } = require("../lib/db");
-const { Parser, Transform } = require("json2csv");
+const { Parser } = require("json2csv");
 
 // Helpers: libellés FR + mapping raisons
 function reasonLabel(key) {
@@ -22,6 +22,19 @@ function statusLabelDaily(day_ok) {
 }
 function statusLabelWeekly(decision) {
   return Number(decision) === 1 ? "DISPONIBLE" : "INDISPONIBLE";
+}
+
+// Récup version courante
+async function getPolicyVersionOr404(policyId, res) {
+  const [[row]] = await pool.query(
+    "SELECT id, current_version FROM kpi2_policy WHERE id = ?",
+    [policyId]
+  );
+  if (!row) {
+    res.status(404).json({ error: `Policy ${policyId} introuvable` });
+    return null;
+  }
+  return Number(row.current_version || 1);
 }
 
 // Optionnel : recalcul avant export si ?auto=1
@@ -60,20 +73,23 @@ exports.dailyExport = async (req, res) => {
     if (!date || !policyId)
       return res.status(400).json({ error: "date & policyId requis" });
 
+    const policyVersion = await getPolicyVersionOr404(policyId, res);
+    if (policyVersion == null) return;
+
     await maybeRecomputeDaily(date, policyId, week_start, auto);
 
-    // On stream pour éviter de charger toute la sortie en RAM
     const [rows] = await pool.query(
       `SELECT terminal_sn, day_ok, slot_ok_count, slot_fail_count,
               JSON_EXTRACT(failed_slots_json,'$')   AS failed_slots_raw,
               JSON_EXTRACT(failed_reasons_json,'$') AS failed_reasons_raw
          FROM kpi2_daily_results
-        WHERE date = ? AND policy_id = ?
+        WHERE date = ?
+          AND policy_id = ?
+          AND policy_version = ?
         ORDER BY terminal_sn`,
-      [date, policyId]
+      [date, policyId, policyVersion]
     );
 
-    // Projection + libellés
     const data = rows.map((r) => {
       let slots = [];
       let reasons = [];
@@ -92,8 +108,9 @@ exports.dailyExport = async (req, res) => {
       return {
         Date: date,
         PolicyID: policyId,
+        "PolicyVersion": policyVersion,
         Terminal: r.terminal_sn,
-        Statut: statusLabelDaily(r.day_ok), // DISPONIBLE/INDISPONIBLE
+        Statut: statusLabelDaily(r.day_ok),
         "Slots OK": Number(r.slot_ok_count),
         "Slots KO": Number(r.slot_fail_count),
         "Créneaux KO": slots.join(" | "),
@@ -101,19 +118,28 @@ exports.dailyExport = async (req, res) => {
       };
     });
 
-    // CSV avec BOM (Excel friendly)
     const parser = new Parser({
       withBOM: true,
-      fields: ["Date", "PolicyID", "Terminal", "Statut", "Slots OK", "Slots KO", "Créneaux KO", "Raisons KO"],
+      fields: [
+        "Date",
+        "PolicyID",
+        "PolicyVersion",
+        "Terminal",
+        "Statut",
+        "Slots OK",
+        "Slots KO",
+        "Créneaux KO",
+        "Raisons KO",
+      ],
     });
     const csv = parser.parse(data);
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="daily_${date}_policy${policyId}.csv"`
+      `attachment; filename="daily_${date}_policy${policyId}_v${policyVersion}.csv"`
     );
-    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
     res.send(csv);
   } catch (err) {
     console.error("dailyExport error:", err);
@@ -130,6 +156,9 @@ exports.weeklyExport = async (req, res) => {
     if (!week_start || !policyId)
       return res.status(400).json({ error: "week_start & policyId requis" });
 
+    const policyVersion = await getPolicyVersionOr404(policyId, res);
+    if (policyVersion == null) return;
+
     await maybeRecomputeWeekly(week_start, policyId, auto);
 
     const [rows] = await pool.query(
@@ -137,9 +166,11 @@ exports.weeklyExport = async (req, res) => {
               JSON_EXTRACT(fail_dates_json,'$')   AS fail_dates_raw,
               JSON_EXTRACT(week_reasons_json,'$') AS week_reasons_raw
          FROM kpi2_weekly_results
-        WHERE week_start = ? AND policy_id = ?
+        WHERE week_start = ?
+          AND policy_id = ?
+          AND policy_version = ?
         ORDER BY terminal_sn`,
-      [week_start, policyId]
+      [week_start, policyId, policyVersion]
     );
 
     const data = rows.map((r) => {
@@ -157,7 +188,6 @@ exports.weeklyExport = async (req, res) => {
             : JSON.parse(r.week_reasons_raw || "{}");
       } catch {}
 
-      // "Raisons semaine" sous forme "RAISON:compteur"
       const reasonsStr = Object.entries(reasonsObj)
         .map(([k, v]) => `${reasonLabel(k)}:${v}`)
         .join(" | ");
@@ -165,8 +195,9 @@ exports.weeklyExport = async (req, res) => {
       return {
         "Semaine (lundi)": week_start,
         PolicyID: policyId,
+        PolicyVersion: policyVersion,
         Terminal: r.terminal_sn,
-        Décision: statusLabelWeekly(r.decision), // DISPONIBLE/INDISPONIBLE
+        Décision: statusLabelWeekly(r.decision),
         "Jours OK": Number(r.days_ok),
         "Jours KO": Number(r.days_fail),
         "Slots OK (sem.)": Number(r.slots_ok_total),
@@ -181,6 +212,7 @@ exports.weeklyExport = async (req, res) => {
       fields: [
         "Semaine (lundi)",
         "PolicyID",
+        "PolicyVersion",
         "Terminal",
         "Décision",
         "Jours OK",
@@ -196,9 +228,9 @@ exports.weeklyExport = async (req, res) => {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="weekly_${week_start}_policy${policyId}.csv"`
+      `attachment; filename="weekly_${week_start}_policy${policyId}_v${policyVersion}.csv"`
     );
-    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
     res.send(csv);
   } catch (err) {
     console.error("weeklyExport error:", err);

@@ -1,12 +1,31 @@
 // controllers/bi.controller.js
 const { pool } = require("../lib/db");
 
+/**
+ * Récupère la version courante d'une policy.
+ * Retourne un { policyVersion } ou envoie un 404 si la policy n'existe pas.
+ */
+async function getPolicyVersionOr404(policyId, res) {
+  const [[row]] = await pool.query(
+    "SELECT id, current_version FROM kpi2_policy WHERE id = ?",
+    [policyId]
+  );
+  if (!row) {
+    res.status(404).json({ error: `Policy ${policyId} introuvable` });
+    return null;
+  }
+  return Number(row.current_version || 1);
+}
+
 exports.dailyUnavailable = async (req, res) => {
   try {
     const date = req.query.date;
     const policyId = Number(req.query.policyId);
     if (!date || !policyId)
       return res.status(400).json({ error: "date & policyId requis" });
+
+    const policyVersion = await getPolicyVersionOr404(policyId, res);
+    if (policyVersion == null) return; // déjà répondu 404
 
     const [rows] = await pool.query(
       `SELECT
@@ -15,9 +34,12 @@ exports.dailyUnavailable = async (req, res) => {
          JSON_EXTRACT(failed_slots_json,'$')   AS slots_raw,
          slot_ok_count, slot_fail_count
        FROM kpi2_daily_results
-       WHERE date = ? AND policy_id = ? AND day_ok = 0
+       WHERE date = ?
+         AND policy_id = ?
+         AND policy_version = ?
+         AND day_ok = 0
        ORDER BY terminal_sn`,
-      [date, policyId]
+      [date, policyId, policyVersion]
     );
 
     const data = rows.map((r) => {
@@ -56,6 +78,9 @@ exports.weeklyUnavailable = async (req, res) => {
     if (!week_start || !policyId)
       return res.status(400).json({ error: "week_start & policyId requis" });
 
+    const policyVersion = await getPolicyVersionOr404(policyId, res);
+    if (policyVersion == null) return;
+
     const [rows] = await pool.query(
       `SELECT
          terminal_sn,
@@ -63,9 +88,12 @@ exports.weeklyUnavailable = async (req, res) => {
          JSON_EXTRACT(week_reasons_json,'$') AS reasons_raw,
          days_ok, days_fail, slots_ok_total, slots_fail_total
        FROM kpi2_weekly_results
-       WHERE week_start = ? AND policy_id = ? AND decision = 0
+       WHERE week_start = ?
+         AND policy_id = ?
+         AND policy_version = ?
+         AND decision = 0
        ORDER BY terminal_sn`,
-      [week_start, policyId]
+      [week_start, policyId, policyVersion]
     );
 
     const data = rows.map((r) => {

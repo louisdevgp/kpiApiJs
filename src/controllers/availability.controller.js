@@ -22,6 +22,29 @@ function isOfflineDurationBad(offline) {
   );
 }
 
+// Limite l'évaluation aux créneaux <= heure courante du jour, ou <= as_of.hour si fourni
+function resolveMaxHour(dateISO, asOfISO) {
+  const day = DateTime.fromISO(dateISO, { zone: "utc" });
+  if (!day.isValid) return 23;
+
+  // Si as_of est fourni, on s'aligne dessus
+  if (asOfISO) {
+    const asOf = DateTime.fromISO(asOfISO, { zone: "utc" });
+    if (!asOf.isValid) return 23;
+    if (asOf.hasSame(day, "day")) return asOf.hour; // même jour → couper à asOf.hour
+    if (asOf < day.startOf("day")) return -1; // as_of avant le jour -> aucun créneau admissible
+    if (asOf >= day.endOf("day")) return 23; // as_of après le jour -> tous les créneaux
+    return 23;
+  }
+
+  // Pas d'as_of → si jour courant (UTC), couper à "now"
+  const now = DateTime.utc();
+  if (now.hasSame(day, "day")) return now.hour;
+
+  // Autre jour → tout le jour
+  return 23;
+}
+
 function parsePrinterStatus(printer) {
   const s = String(printer || "").trim().toLowerCase();
   if (!s) return { paper: "unknown", batteryHint: null };
@@ -39,6 +62,7 @@ function isStatusActive(status) {
   const s = String(status).toLowerCase();
   return s.includes("active") || s.includes("online");
 }
+
 function parseSignal(signal) {
   if (signal == null) return 0;
   const n = Number(signal);
@@ -58,7 +82,28 @@ function isPrinterOk(printer) {
   return String(printer).toLowerCase() === "available";
 }
 
+/**
+ * Résout la version de policy à utiliser :
+ * - si policyVersion est donné en query → on l'utilise
+ * - sinon on prend current_version dans kpi2_policy
+ */
+async function resolvePolicyVersion(policyId, policyVersionFromQuery) {
+  const n = Number(policyVersionFromQuery);
+  if (Number.isFinite(n) && n > 0) return n;
+
+  const [[row]] = await pool.query(
+    "SELECT current_version FROM kpi2_policy WHERE id = ?",
+    [policyId]
+  );
+  if (!row) {
+    throw new Error(`Policy ${policyId} introuvable`);
+  }
+  return Number(row.current_version || 1);
+}
+
 async function getLockedPolicyForWeekOrActive(weekStartISO, explicitPolicyId) {
+  // ⚠️ On garde la logique existante (lock par semaine) mais la policy
+  // retournée contient maintenant current_version, qu'on utilisera partout.
   if (explicitPolicyId) {
     const [rows] = await pool.query("SELECT * FROM kpi2_policy WHERE id = ?", [
       explicitPolicyId,
@@ -150,7 +195,8 @@ async function fetchBestRowsByHourInDay(dateISO) {
 
 /**
  * Retourne { ok: boolean, reasons: string[] }
- * reasons ∈ { OFFLINE_DURATION, STATUS_INACTIVE, SIGNAL_LOW, GEOFENCE_OUT, BATTERY_LOW, PAPER_OUT, PAPER_UNKNOWN, PAPER_UNKNOWN_WARN, NO_DATA }
+ * reasons ∈ { OFFLINE_DURATION, STATUS_INACTIVE, SIGNAL_LOW, GEOFENCE_OUT, BATTERY_LOW, PAPER_OUT,
+ *             PAPER_UNKNOWN, PAPER_UNKNOWN_WARN, NO_DATA }
  */
 function evalSlot(rowOrNull, policy) {
   if (!rowOrNull) return { ok: false, reasons: ["NO_DATA"] };
@@ -235,11 +281,20 @@ exports.computeDaily = async (req, res) => {
       : toMonday(dateISO);
     const policyId = req.body.policyId ? Number(req.body.policyId) : undefined;
 
+    // as_of optionnel pour couper les créneaux au moment précis
+    const asOfISO = req.body.as_of ? String(req.body.as_of) : null;
+
     const policy = await getLockedPolicyForWeekOrActive(weekStartISO, policyId);
+    const policyVersion = Number(policy.current_version || 1);
 
     const hours = Array.isArray(policy.slot_hours_json)
       ? policy.slot_hours_json.map(Number).filter(Number.isFinite)
-      : [12, 13, 14, 15, 17, 18];
+      : [12, 13, 14, 15, 17, 18, 19];
+
+    // Couper les créneaux aux données réellement disponibles (instant t)
+    const maxHour = resolveMaxHour(dateISO, asOfISO);
+    const hoursToEval =
+      maxHour < 0 ? [] : hours.filter((h) => Number(h) <= maxHour);
 
     // best rows par hour
     const bestRows = await fetchBestRowsByHourInDay(dateISO);
@@ -263,7 +318,7 @@ exports.computeDaily = async (req, res) => {
       const failedSlots = [];
       const reasonsSet = new Set();
 
-      for (const h of hours) {
+      for (const h of hoursToEval) {
         const row = bySn.get(sn)?.get(h) || null;
         const slotRes = evalSlot(row, policy);
         if (slotRes.ok) okCount++;
@@ -278,41 +333,44 @@ exports.computeDaily = async (req, res) => {
       }
 
       const day_ok = failCount < Number(policy.daily_fail_N || 0);
+
       upserts.push([
-        dateISO,
-        sn,
-        policy.id,
-        day_ok ? 1 : 0,
-        okCount,
-        failCount,
-        JSON.stringify(failedSlots),
-        JSON.stringify(Array.from(reasonsSet)),
+        dateISO, // date
+        sn, // terminal_sn
+        policy.id, // policy_id
+        policyVersion, // policy_version
+        day_ok ? 1 : 0, // day_ok
+        okCount, // slot_ok_count
+        failCount, // slot_fail_count
+        JSON.stringify(failedSlots), // failed_slots_json
+        JSON.stringify(Array.from(reasonsSet)), // failed_reasons_json
       ]);
     }
 
     if (upserts.length) {
       const placeholders = upserts
-        .map(() => "(?,?,?,?,?, ?, CAST(? AS JSON), CAST(? AS JSON), NOW())")
+        .map(() => "(?,?,?,?,?,?,?,?,?,NOW())")
         .join(",");
-      const flat = [];
-      upserts.forEach(([d, sn, pid, dok, okc, fc, slots, reasons]) =>
-        flat.push(d, sn, pid, dok, okc, fc, slots, reasons)
-      );
+      const flat = upserts.flat(); // [d, sn, pid, pver, dok, okc, fc, slotsJson, reasonsJson, d2, sn2, ...]
 
-      await pool.query(
-        `INSERT INTO kpi2_daily_results
-           (date, terminal_sn, policy_id, day_ok, slot_ok_count, slot_fail_count, failed_slots_json, failed_reasons_json, computed_at)
-         VALUES ${placeholders}
-         ON DUPLICATE KEY UPDATE
-           day_ok = VALUES(day_ok),
-           slot_ok_count = VALUES(slot_ok_count),
-           slot_fail_count = VALUES(slot_fail_count),
-           failed_slots_json = VALUES(failed_slots_json),
-           failed_reasons_json = VALUES(failed_reasons_json),
-           computed_at = NOW()`,
-        flat
-      );
+      const sql = `
+        INSERT INTO kpi2_daily_results
+          (date, terminal_sn, policy_id, policy_version,
+           day_ok, slot_ok_count, slot_fail_count,
+           failed_slots_json, failed_reasons_json, computed_at)
+        VALUES ${placeholders}
+        ON DUPLICATE KEY UPDATE
+          day_ok              = VALUES(day_ok),
+          slot_ok_count       = VALUES(slot_ok_count),
+          slot_fail_count     = VALUES(slot_fail_count),
+          failed_slots_json   = VALUES(failed_slots_json),
+          failed_reasons_json = VALUES(failed_reasons_json),
+          computed_at         = NOW()
+      `;
+
+      await pool.query(sql, flat);
     }
+
     res.json({ ok: true, count: upserts.length });
   } catch (err) {
     console.error("computeDaily error:", err);
@@ -320,126 +378,8 @@ exports.computeDaily = async (req, res) => {
   }
 };
 
-// exports.getDaily = async (req, res) => {
-//   try {
-//     const dateISO = toISODate(req.query.date);
-//     const policyId = Number(req.query.policyId);
-//     if (!dateISO || !policyId) {
-//       return res.status(400).json({ error: "date & policyId requis" });
-//     }
+// ================= getDaily =================
 
-//     const page = Math.max(1, Number(req.query.page || 1));
-//     const pageSize = Math.min(
-//       1000,
-//       Math.max(1, Number(req.query.pageSize || 200))
-//     );
-//     const search = (req.query.search || "").trim();
-
-//     const where = ["date = ?", "policy_id = ?"];
-//     const args = [dateISO, policyId];
-//     if (search) {
-//       where.push("terminal_sn LIKE ?");
-//       args.push(`%${search}%`);
-//     }
-//     const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-
-//     // totals + counters OK/KO
-//     const [[cntRow]] = await pool.query(
-//       `SELECT 
-//          COUNT(*) AS total,
-//          SUM(CASE WHEN day_ok=1 THEN 1 ELSE 0 END) AS ok_count,
-//          SUM(CASE WHEN day_ok=0 THEN 1 ELSE 0 END) AS ko_count
-//        FROM kpi2_daily_results ${whereSql}`,
-//       args
-//     );
-//     const total = Number(cntRow?.total || 0);
-//     const okCount = Number(cntRow?.ok_count || 0);
-//     const koCount = Number(cntRow?.ko_count || 0);
-
-//     args.push((page - 1) * pageSize, pageSize);
-
-//     const [rows] = await pool.query(
-//       `SELECT 
-//           DATE_FORMAT(date, '%Y-%m-%d')                    AS date_fmt,
-//           terminal_sn,
-//           policy_id,
-//           day_ok,
-//           slot_ok_count,
-//           slot_fail_count,
-//           JSON_EXTRACT(failed_slots_json, '$')             AS failed_slots_raw,
-//           JSON_EXTRACT(failed_reasons_json, '$')           AS failed_reasons_raw,
-//           DATE_FORMAT(computed_at, '%Y-%m-%d %H:%i:%s')    AS computed_at_fmt
-//        FROM kpi2_daily_results
-//        ${whereSql}
-//        ORDER BY terminal_sn
-//        LIMIT ?, ?`,
-//       args
-//     );
-
-//     const data = rows.map((r) => {
-//       let failedSlots = [];
-//       let failedReasons = [];
-//       try {
-//         const parsed =
-//           Array.isArray(r.failed_slots_raw)
-//             ? r.failed_slots_raw
-//             : JSON.parse(r.failed_slots_raw || "[]");
-//         failedSlots = (parsed || []).map((s) => fmtDateTime(s)).filter(Boolean);
-//       } catch {
-//         failedSlots = [];
-//       }
-//       try {
-//         failedReasons = Array.isArray(r.failed_reasons_raw)
-//           ? r.failed_reasons_raw
-//           : JSON.parse(r.failed_reasons_raw || "[]");
-//       } catch {
-//         failedReasons = [];
-//       }
-
-//       return {
-//         date: r.date_fmt,
-//         terminal_sn: r.terminal_sn,
-//         policy_id: r.policy_id,
-//         day_ok: !!r.day_ok,
-//         slot_ok_count: Number(r.slot_ok_count),
-//         slot_fail_count: Number(r.slot_fail_count),
-//         failed_slots: failedSlots, // 'YYYY-MM-DD HH:mm:ss'
-//         failed_reasons: failedReasons, // ['BATTERY_LOW', 'PAPER_OUT', ...]
-//         computed_at: r.computed_at_fmt,
-//       };
-//     });
-
-//     // === AJOUT résumé (dispo / indispo + pourcentages) ===
-//     const available_pct = total ? (okCount * 100) / total : 0;
-//     const unavailable_pct = total ? (koCount * 100) / total : 0;
-
-//     res.json({
-//       data,
-//       meta: {
-//         total,
-//         page,
-//         pageSize,
-//         available_count: okCount,
-//         unavailable_count: koCount,
-//       },
-//       summary: {
-//         tpe_day_total: total,
-//         available_count: okCount,
-//         unavailable_count: koCount,
-//         available_pct: Number(available_pct.toFixed(2)),
-//         unavailable_pct: Number(unavailable_pct.toFixed(2)),
-//       },
-//     });
-//   } catch (err) {
-//     console.error("getDaily error:", err);
-//     res.status(500).json({ error: err.message || "getDaily failed" });
-//   }
-// };
-
-// ================= WEEKLY =================
-
-
-// controllers/availability.controller.js
 exports.getDaily = async (req, res) => {
   try {
     const dateISO = toISODate(req.query.date);
@@ -449,12 +389,20 @@ exports.getDaily = async (req, res) => {
     }
 
     const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize || 200)));
+    const pageSize = Math.min(
+      1000,
+      Math.max(1, Number(req.query.pageSize || 200))
+    );
     const search = (req.query.search || "").trim();
     const status = (req.query.status || "all").toLowerCase(); // all|available|unavailable
 
-    const where = ["date = ?", "policy_id = ?"];
-    const args = [dateISO, policyId];
+    const policyVersion = await resolvePolicyVersion(
+      policyId,
+      req.query.policyVersion
+    );
+
+    const where = ["date = ?", "policy_id = ?", "policy_version = ?"];
+    const args = [dateISO, policyId, policyVersion];
 
     if (search) {
       where.push("terminal_sn LIKE ?");
@@ -486,6 +434,7 @@ exports.getDaily = async (req, res) => {
           DATE_FORMAT(date, '%Y-%m-%d')                 AS date_fmt,
           terminal_sn,
           policy_id,
+          policy_version,
           day_ok,
           slot_ok_count,
           slot_fail_count,
@@ -503,22 +452,25 @@ exports.getDaily = async (req, res) => {
       let failedSlots = [];
       let failedReasons = [];
       try {
-        const parsed = typeof r.failed_slots_raw === "string"
-          ? JSON.parse(r.failed_slots_raw || "[]")
-          : r.failed_slots_raw;
+        const parsed =
+          typeof r.failed_slots_raw === "string"
+            ? JSON.parse(r.failed_slots_raw || "[]")
+            : r.failed_slots_raw;
         failedSlots = (parsed || []).map((s) => fmtDateTime(s)).filter(Boolean);
       } catch {}
 
       try {
-        failedReasons = typeof r.failed_reasons_raw === "string"
-          ? JSON.parse(r.failed_reasons_raw || "[]")
-          : (r.failed_reasons_raw || []);
+        failedReasons =
+          typeof r.failed_reasons_raw === "string"
+            ? JSON.parse(r.failed_reasons_raw || "[]")
+            : r.failed_reasons_raw || [];
       } catch {}
 
       return {
         date: r.date_fmt,
         terminal_sn: r.terminal_sn,
         policy_id: r.policy_id,
+        policy_version: r.policy_version,
         day_ok: !!r.day_ok,
         slot_ok_count: Number(r.slot_ok_count),
         slot_fail_count: Number(r.slot_fail_count),
@@ -554,7 +506,7 @@ exports.getDaily = async (req, res) => {
   }
 };
 
-
+// ================= WEEKLY =================
 
 exports.computeWeekly = async (req, res) => {
   try {
@@ -569,10 +521,33 @@ exports.computeWeekly = async (req, res) => {
     const auto = !!req.body.auto;
 
     const policy = await getLockedPolicyForWeekOrActive(weekStartISO, policyId);
-    const { start, end } = weekRange(weekStartISO);
+    const policyVersion = Number(policy.current_version || 1);
 
+    const { start, end } = weekRange(weekStartISO); // end = lundi suivant (exclu)
+
+    // --- Cutoff = min(aujourd'hui, dimanche de la semaine)
+    const todayISO = DateTime.utc().toISODate();
+    const lastWeekDayISO = start.plus({ days: 6 }).toISODate();
+    const cutoffISO = todayISO < lastWeekDayISO ? todayISO : lastWeekDayISO;
+    const cutoffExclusiveISO = DateTime.fromISO(cutoffISO, { zone: "utc" })
+      .plus({ days: 1 })
+      .toISODate();
+
+    // (re)calc daily uniquement jusqu'au cutoff si auto=true
     if (auto) {
-      for (let i = 0; i < 7; i++) {
+      // jours à recalculer = du lundi jusqu'au cutoff inclus
+      const daysSpan = Math.max(
+        1,
+        Math.min(
+          7,
+          Math.floor(
+            DateTime.fromISO(cutoffISO, { zone: "utc" }).diff(start, "days")
+              .days
+          ) + 1
+        )
+      );
+      const asOfNow = DateTime.utc().toISO(); // pour le jour courant, couper les créneaux au "now"
+      for (let i = 0; i < daysSpan; i++) {
         const dISO = start.plus({ days: i }).toISODate();
         try {
           await exports.computeDaily(
@@ -581,6 +556,7 @@ exports.computeWeekly = async (req, res) => {
                 date: dISO,
                 week_start: weekStartISO,
                 policyId: policy.id,
+                as_of: dISO === todayISO ? asOfNow : undefined,
               },
             },
             { json: () => {}, status: () => ({ json: () => {} }) }
@@ -595,6 +571,7 @@ exports.computeWeekly = async (req, res) => {
       }
     }
 
+    // Agrégation bornée à cutoffExclusive (ignore les jours futurs)
     const [agg] = await pool.query(
       `SELECT
           terminal_sn,
@@ -606,15 +583,15 @@ exports.computeWeekly = async (req, res) => {
             IF(day_ok = 0, DATE_FORMAT(date, '%Y-%m-%d'), NULL)
           ) AS fail_dates_raw
        FROM kpi2_daily_results
-      WHERE date >= ? AND date < ? AND policy_id = ?
+      WHERE date >= ? AND date < ? AND policy_id = ? AND policy_version = ?
       GROUP BY terminal_sn`,
-      [start.toISODate(), end.toISODate(), policy.id]
+      [start.toISODate(), cutoffExclusiveISO, policy.id, policyVersion]
     );
 
     if (!agg.length) {
       return res.json({
         ok: true,
-        message: "Aucune donnée daily pour la semaine",
+        message: "Aucune donnée daily pour la période évaluée",
         count: 0,
       });
     }
@@ -622,9 +599,9 @@ exports.computeWeekly = async (req, res) => {
     const [reasonsAgg] = await pool.query(
       `SELECT terminal_sn, JSON_ARRAYAGG(failed_reasons_json) AS reasons_arrays
          FROM kpi2_daily_results
-        WHERE date >= ? AND date < ? AND policy_id = ?
+        WHERE date >= ? AND date < ? AND policy_id = ? AND policy_version = ?
         GROUP BY terminal_sn`,
-      [start.toISODate(), end.toISODate(), policy.id]
+      [start.toISODate(), cutoffExclusiveISO, policy.id, policyVersion]
     );
     const reasonsMap = new Map();
     for (const row of reasonsAgg) {
@@ -684,9 +661,7 @@ exports.computeWeekly = async (req, res) => {
 
     if (rows.length) {
       const placeholders = rows
-        .map(
-          () => "(?,?,?,?,?,?,?,?, CAST(? AS JSON), CAST(? AS JSON), NOW())"
-        )
+        .map(() => "(?,?,?,?,?,?,?,?,?,?,?,NOW())")
         .join(",");
       const args = [];
       for (const x of rows) {
@@ -694,6 +669,7 @@ exports.computeWeekly = async (req, res) => {
           weekStartISO, // week_start
           x.terminal_sn,
           policy.id,
+          policyVersion,
           x.decision, // 1/0
           x.days_ok,
           x.days_fail,
@@ -704,21 +680,24 @@ exports.computeWeekly = async (req, res) => {
         );
       }
 
-      await pool.query(
-        `INSERT INTO kpi2_weekly_results
-           (week_start, terminal_sn, policy_id, decision, days_ok, days_fail, slots_ok_total, slots_fail_total, fail_dates_json, week_reasons_json, computed_at)
+      const sql = `
+        INSERT INTO kpi2_weekly_results
+           (week_start, terminal_sn, policy_id, policy_version,
+            decision, days_ok, days_fail, slots_ok_total, slots_fail_total,
+            fail_dates_json, week_reasons_json, computed_at)
          VALUES ${placeholders}
          ON DUPLICATE KEY UPDATE
-           decision         = VALUES(decision),
-           days_ok          = VALUES(days_ok),
-           days_fail        = VALUES(days_fail),
-           slots_ok_total   = VALUES(slots_ok_total),
-           slots_fail_total = VALUES(slots_fail_total),
-           fail_dates_json  = VALUES(fail_dates_json),
-           week_reasons_json= VALUES(week_reasons_json),
-           computed_at      = NOW()`,
-        args
-      );
+           decision          = VALUES(decision),
+           days_ok           = VALUES(days_ok),
+           days_fail         = VALUES(days_fail),
+           slots_ok_total    = VALUES(slots_ok_total),
+           slots_fail_total  = VALUES(slots_fail_total),
+           fail_dates_json   = VALUES(fail_dates_json),
+           week_reasons_json = VALUES(week_reasons_json),
+           computed_at       = NOW()
+      `;
+
+      await pool.query(sql, args);
     }
 
     res.json({ ok: true, count: rows.length });
@@ -736,6 +715,11 @@ exports.getWeekly = async (req, res) => {
       return res.status(400).json({ error: "week_start & policyId requis" });
     }
 
+    const policyVersion = await resolvePolicyVersion(
+      policyId,
+      req.query.policyVersion
+    );
+
     const page = Math.max(1, Number(req.query.page || 1));
     const pageSize = Math.min(
       1000,
@@ -747,8 +731,8 @@ exports.getWeekly = async (req, res) => {
     const order =
       (req.query.order || "desc").toLowerCase() === "asc" ? "asc" : "desc";
 
-    const where = ["week_start = ?", "policy_id = ?"];
-    const args = [weekStartISO, policyId];
+    const where = ["week_start = ?", "policy_id = ?", "policy_version = ?"];
+    const args = [weekStartISO, policyId, policyVersion];
     if (search) {
       where.push("terminal_sn LIKE ?");
       args.push(`%${search}%`);
@@ -780,9 +764,10 @@ exports.getWeekly = async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT
-          week_start,
+          DATE_FORMAT(week_start,'%Y-%m-%d')        AS week_start_fmt,
           terminal_sn,
           policy_id,
+          policy_version,
           decision,
           days_ok,
           days_fail,
@@ -790,7 +775,7 @@ exports.getWeekly = async (req, res) => {
           slots_fail_total,
           JSON_EXTRACT(fail_dates_json, '$')   AS fail_dates_json,
           JSON_EXTRACT(week_reasons_json, '$') AS week_reasons_json,
-          computed_at
+          DATE_FORMAT(computed_at,'%Y-%m-%d %H:%i:%s') AS computed_at_fmt
        FROM kpi2_weekly_results
        ${whereSql}
        ORDER BY ${orderBy}
@@ -818,9 +803,10 @@ exports.getWeekly = async (req, res) => {
       }
 
       return {
-        week_start: r.week_start,
+        week_start: r.week_start_fmt,
         terminal_sn: r.terminal_sn,
         policy_id: r.policy_id,
+        policy_version: r.policy_version,
         decision: decisionLabel,
         days_ok: Number(r.days_ok),
         days_fail: Number(r.days_fail),
@@ -828,7 +814,7 @@ exports.getWeekly = async (req, res) => {
         slots_fail_total: Number(r.slots_fail_total),
         fail_dates,
         week_reasons,
-        computed_at: r.computed_at,
+        computed_at: r.computed_at_fmt,
       };
     });
 

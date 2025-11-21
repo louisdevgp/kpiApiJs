@@ -26,6 +26,12 @@ app.use('/api/export', exportRoutes);
 // 404
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
+
+// app.use(express.static('dist'));
+// app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'dist/index.html')));
+
+
+
 // error handler
 app.use((err, _req, res, _next) => {
   console.error('Unhandled:', err);
